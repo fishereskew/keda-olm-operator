@@ -58,7 +58,7 @@ const (
 
 	// Allowed Name of KedaController resource
 	kedaControllerResourceName      = "keda"
-	kedaDefaultControllerAnnotation = "keda-olm-operator.openshift.io/create-default-controller" //TODO: NAMING CONVENTION??
+	kedaDefaultControllerAnnotation = "keda-olm-operator/create-default-controller"
 
 	grpcClientCertsSecretName     = "kedaorg-certs"
 	caBundleConfigMapName         = "keda-ocp-cabundle"
@@ -125,11 +125,11 @@ func (r *KedaControllerReconciler) SetupWithManager(mgr ctrl.Manager, kedaContro
 }
 
 func (r *KedaControllerReconciler) ensureKedaController(logger logr.Logger) {
-	// Wait for cache to sync before retrival
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) //TODO: How should I set the context
+	// Wait for cache to sync before retrieval
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if !r.mgr.GetCache().WaitForCacheSync(ctx) { //TODO: Is this correct?
-		logger.Error(ctx.Err(), "Cache sync wait timed out")
+	if !r.mgr.GetCache().WaitForCacheSync(ctx) {
+		logger.Error(ctx.Err(), "Cache sync wait timeout")
 		return
 	}
 
@@ -138,13 +138,12 @@ func (r *KedaControllerReconciler) ensureKedaController(logger logr.Logger) {
 	err := r.Client.Get(ctx, types.NamespacedName{Name: r.resourceNamespace}, kedaNamespace)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			logger.Error(err, "Operator namespace not found.") //TODO: Should this return? Is this error even possible?
+			logger.Error(err, "Keda namespace not found.")
 			return
 		}
-		logger.Error(err, "Failed to get operator's namespace to check annotation.") //TODO: Should this return?
+		logger.Error(err, "Failed to get Keda namespace to check annotation.")
 		return
 	}
-	kedaNamespaceCopy := kedaNamespace.DeepCopy()
 
 	// Get annotations from namespace
 	annotations := kedaNamespace.GetAnnotations()
@@ -153,13 +152,14 @@ func (r *KedaControllerReconciler) ensureKedaController(logger logr.Logger) {
 	}
 
 	// If operator namespace is not annotated, annotate and create a default KedaController if one doesn't exist
-	if _, ok := kedaNamespace.GetAnnotations()[kedaDefaultControllerAnnotation]; !ok {
-		err = r.Client.Get(ctx, types.NamespacedName{Name: r.resourceNamespace, Namespace: r.resourceNamespace}, &kedav1alpha1.KedaController{})
+	if _, ok := annotations[kedaDefaultControllerAnnotation]; !ok {
+		err = r.Client.Get(ctx, types.NamespacedName{Name: kedaControllerResourceName, Namespace: r.resourceNamespace}, &kedav1alpha1.KedaController{})
 		if err != nil {
 			if errors.IsNotFound(err) {
 				logger.Info("KedaController does not exist. Creating default KedaController resource")
 				instance := r.initalizeDefaultController()
-				if err = r.Client.Create(ctx, instance); err != nil {
+				err = r.Client.Create(ctx, instance)
+				if err != nil {
 					logger.Error(err, "Error creating default KedaController")
 					return
 				}
@@ -171,15 +171,22 @@ func (r *KedaControllerReconciler) ensureKedaController(logger logr.Logger) {
 			logger.Info("KedaController already exists")
 		}
 		// Set annotation in operator's namespace
+		kedaNamespaceCopy := kedaNamespace.DeepCopy()
+		annotations = kedaNamespaceCopy.GetAnnotations()
+
 		annotations[kedaDefaultControllerAnnotation] = "true"
-		kedaNamespace.SetAnnotations(annotations) //TODO: Is this needed in addition to the previous line?
-		r.Client.Patch(ctx, kedaNamespace, client.MergeFrom(kedaNamespaceCopy))
+		kedaNamespaceCopy.SetAnnotations(annotations)
+		err = r.Client.Patch(ctx, kedaNamespaceCopy, client.StrategicMergeFrom(kedaNamespace))
+		if err != nil {
+			logger.Error(err, "Error patching namespace with annotation for default KedaController creation")
+			return
+		}
 	}
 
 }
 
 func (r *KedaControllerReconciler) initalizeDefaultController() *kedav1alpha1.KedaController {
-	//TODO: Create default controller
+	// Create default controller
 	keda := &kedav1alpha1.KedaController{}
 	keda.APIVersion = "keda.sh/v1alpha1"
 	keda.Kind = "KedaController"
@@ -191,8 +198,6 @@ func (r *KedaControllerReconciler) initalizeDefaultController() *kedav1alpha1.Ke
 	keda.Spec.MetricsServer.LogLevel = "0"
 	keda.Spec.AdmissionWebhooks.LogLevel = "info"
 	keda.Spec.AdmissionWebhooks.LogEncoder = "console"
-
-	//TODO: Should I add resource specs???
 
 	return keda
 }

@@ -28,6 +28,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -115,36 +116,85 @@ var _ = Describe("Deploying KedaController manifest", func() {
 
 var _ = Describe("Testing functionality", func() {
 
-	var _ = Describe("Default KedaController and Annotation Creation", func() {
+	// NOTE: These test cases assume that the ensureKedaController code remains in SetupWithManager() and
+	// 		 that this context block is run before any tests that create / delete the kedacontroller instance
+	//		 since it is testing the default controller created when SetupWithManager() is called in suite_test.go
+	var _ = Describe("Default KedaController Creation", func() {
 		const (
 			timeout                         = time.Second * 60
 			interval                        = time.Millisecond * 250
-			namespace                       = "keda"
+			controllerName                  = "keda"
 			kedaDefaultControllerAnnotation = "keda-olm-operator/create-default-controller"
 			deploymentName                  = "keda-operator"
+			kedaManifestFilepath            = "../../../config/samples/keda_v1alpha1_kedacontroller.yaml"
 		)
 
 		var (
-			ctx = context.Background()
-			err error
+			err                error
+			controllerInstance = &kedav1alpha1.KedaController{}
+			nsInstance         = &corev1.Namespace{}
+			testCtx            context.Context
+			CancelFunc         context.CancelFunc
+			namespace          = "keda"
 		)
 
-		Context("Default KedaController & annotation exist after operator installation", func() {
-			It("Should find the correct annotation in the keda namespace", func() {
-				kedaNamespace := &corev1.Namespace{}
+		BeforeEach(func() {
+			testCtx, CancelFunc = context.WithCancel(context.Background())
+		})
+
+		AfterEach(func() {
+			CancelFunc()
+		})
+
+		Context("Default controller is created on startup and annotation prevents recreation", func() {
+
+			It("Should create KedaController and annotation upon startup", func() {
+				// Check that controller was created
+				Eventually(func() error {
+					err = k8sClient.Get(testCtx, types.NamespacedName{Name: controllerName, Namespace: namespace}, controllerInstance)
+					return err
+				}, timeout, interval).Should(Succeed())
+
+				// Check for annotation
 				Eventually(func(g Gomega) {
-					err = k8sClient.Get(ctx, types.NamespacedName{Name: namespace}, kedaNamespace)
+					err = k8sClient.Get(testCtx, types.NamespacedName{Name: namespace}, nsInstance)
 					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(kedaNamespace.GetAnnotations()).To(HaveKeyWithValue(kedaDefaultControllerAnnotation, "true"))
+					g.Expect(nsInstance.GetAnnotations()).To(HaveKeyWithValue(kedaDefaultControllerAnnotation, "true"))
 				}, timeout, interval).Should(Succeed())
 			})
 
-			It("Should retrieve the default KedaController instance", func() {
-				kedaInstance := &kedav1alpha1.KedaController{}
-				Eventually(func() error {
-					err = k8sClient.Get(ctx, types.NamespacedName{Name: namespace, Namespace: namespace}, kedaInstance)
-					return err
+			It("Should not create default KedaController when annotation is present", func() {
+				// Delete KedaController to test running SetupWithManager() with annotation present
+				err = k8sClient.Get(testCtx, types.NamespacedName{Name: controllerName, Namespace: namespace}, controllerInstance)
+				if err == nil { // delete controller if it exists
+					Expect(k8sClient.Delete(testCtx, controllerInstance)).To(Succeed())
+				} else if !apierrors.IsNotFound(err) {
+					Fail("Could not get controller")
+				}
+
+				// Ensure controller does not exist
+				Eventually(func() bool {
+					err = k8sClient.Get(testCtx, types.NamespacedName{Name: controllerName, Namespace: namespace}, controllerInstance)
+					return apierrors.IsNotFound(err)
+				}, timeout, interval).Should(BeTrue())
+
+				// Ensure annotation is in namespace
+				Eventually(func(g Gomega) {
+					err = k8sClient.Get(testCtx, types.NamespacedName{Name: namespace}, nsInstance)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(nsInstance.GetAnnotations()).To(HaveKeyWithValue(kedaDefaultControllerAnnotation, "true"))
 				}, timeout, interval).Should(Succeed())
+
+				// Trigger SetupWithManager()
+				kedaControllerReconciler.Client = k8sManager.GetClient()
+				kedaControllerReconciler.ensureKedaController(kedaControllerReconciler.Log)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Check that controller was not created
+				Consistently(func() bool {
+					err = k8sClient.Get(testCtx, types.NamespacedName{Name: controllerName, Namespace: namespace}, controllerInstance)
+					return apierrors.IsNotFound(err)
+				}, "2s", "250ms").Should(BeTrue())
 			})
 		})
 	})
